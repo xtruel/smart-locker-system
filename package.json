@@ -1,0 +1,14 @@
+{
+  "name": "smart-locker-system",
+  "version": "1.0.0",
+  "description": "Smart Locker System - Backend + Frontend",
+  "type": "module",
+  "scripts": {
+    "start": "node backend/src/server.js",
+    "build": "npm install --prefix backend",
+    "dev": "npx nodemon backend/src/server.js"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}

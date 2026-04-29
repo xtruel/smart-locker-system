@@ -2,28 +2,45 @@ import express from 'express';
 import cors from 'cors';
 import dotenv from 'dotenv';
 import { createClient } from '@supabase/supabase-js';
+import path from 'path';
+import { fileURLToPath } from 'url';
 
+// Carica .env (utile solo in locale, su Render le env vars sono iniettate automaticamente)
 dotenv.config();
+dotenv.config({ path: path.resolve(process.cwd(), 'backend/.env') });
 
 const app = express();
 app.use(cors());
 app.use(express.json());
 
-// Serve static frontend files
-import path from 'path';
-import { fileURLToPath } from 'url';
+// Serve static frontend files - cerca la cartella public in vari percorsi possibili
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
-app.use(express.static(path.join(__dirname, '../../public')));
+
+// Prova prima relativo a server.js (../../public), poi relativo al cwd (./public)
+const publicPath = path.join(__dirname, '../../public');
+app.use(express.static(publicPath));
+app.use(express.static(path.join(process.cwd(), 'public')));
+
+// Controlla variabili d'ambiente
+if (!process.env.SUPABASE_URL || !process.env.SUPABASE_SERVICE_KEY) {
+  console.error('⚠️  ATTENZIONE: SUPABASE_URL o SUPABASE_SERVICE_KEY non configurate!');
+  console.error('   Il server partirà ma le chiamate al database falliranno.');
+}
 
 // Inizializza Supabase con SERVICE ROLE KEY per bypassare RLS e agire come Admin
 const supabase = createClient(
-  process.env.SUPABASE_URL,
-  process.env.SUPABASE_SERVICE_KEY
+  process.env.SUPABASE_URL || 'https://placeholder.supabase.co',
+  process.env.SUPABASE_SERVICE_KEY || 'placeholder'
 );
 
 // Helper: Genera un PIN a 4 cifre random
 const generatePin = () => Math.floor(1000 + Math.random() * 9000).toString();
+
+// Health check endpoint (utile per Render per verificare che il server sia vivo)
+app.get('/health', (req, res) => {
+  res.json({ status: 'ok', timestamp: new Date().toISOString() });
+});
 
 /**
  * 1. POST /generate-booking
@@ -147,7 +164,12 @@ app.get('/lockers', async (req, res) => {
   }
 });
 
+// Fallback: serve index.html per qualsiasi route non trovata (SPA-style)
+app.get('*', (req, res) => {
+  res.sendFile(path.join(publicPath, 'index.html'));
+});
+
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
+app.listen(PORT, '0.0.0.0', () => {
   console.log(`🔒 Smart Locker Backend running on port ${PORT}`);
 });

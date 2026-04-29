@@ -7,7 +7,7 @@
 const char* ssid = "IL_TUO_WIFI";
 const char* password = "LA_TUA_PASSWORD_WIFI";
 // L'IP del tuo server backend Node.js, es: http://192.168.1.100:3000/verify-pin
-const char* backendUrl = "http://INDIRIZZO_IP_BACKEND:3000/verify-pin";
+const char* backendUrl = "https://smart-locker-system-4gn6.onrender.com/verify-pin";
 
 // L'ID del locker deve corrispondere esattamente all'UUID su Supabase
 const String lockerId = "INSERISCI-UUID-DEL-LOCKER-QUI";
