@@ -1,0 +1,96 @@
+<!DOCTYPE html>
+<html lang="it">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Smart Locker - Dashboard Utente</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body class="bg-gray-900 text-white min-h-screen font-['Inter']">
+
+  <!-- Header -->
+  <header class="p-6 border-b border-gray-800 bg-gray-900/50 backdrop-blur-md sticky top-0 z-50">
+    <div class="max-w-5xl mx-auto flex justify-between items-center">
+      <h1 class="text-2xl font-bold bg-clip-text text-transparent bg-gradient-to-r from-blue-400 to-emerald-400">
+        🔐 Smart Locker
+      </h1>
+      <div class="text-sm text-gray-400">Dashboard Utente & Simulatore</div>
+    </div>
+  </header>
+
+  <main class="max-w-5xl mx-auto p-6 mt-8 space-y-12">
+    
+    <!-- Sezione 1: Lista Armadietti -->
+    <section>
+      <h2 class="text-xl font-semibold mb-6 flex items-center gap-2">
+        <span>📍 Armadietti Disponibili</span>
+        <button onclick="fetchLockers()" class="text-sm bg-gray-800 hover:bg-gray-700 px-3 py-1 rounded transition">🔄 Aggiorna</button>
+      </h2>
+      <div id="lockers-container" class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
+        <!-- Armadietti caricati tramite JS -->
+        <div class="text-gray-500 animate-pulse">Caricamento armadietti...</div>
+      </div>
+    </section>
+
+    <hr class="border-gray-800">
+
+    <!-- Sezione 2: Il mio PIN e Simulatore -->
+    <section class="grid grid-cols-1 md:grid-cols-2 gap-8">
+      
+      <!-- Box Prenotazione Corrente -->
+      <div class="glass-panel p-8 rounded-2xl relative overflow-hidden">
+        <div class="absolute top-0 left-0 w-1 h-full bg-blue-500"></div>
+        <h3 class="text-lg font-semibold mb-2 text-blue-400">La Tua Prenotazione</h3>
+        <p class="text-sm text-gray-400 mb-6">Prenota un armadietto per visualizzare il tuo codice d'accesso temporaneo.</p>
+        
+        <div id="active-booking" class="hidden">
+          <div class="text-center p-6 bg-gray-800/50 rounded-xl border border-gray-700">
+            <p class="text-sm text-gray-400 uppercase tracking-widest mb-2">Il tuo PIN Segreto</p>
+            <p id="pin-display" class="text-5xl font-mono font-bold tracking-widest text-emerald-400">----</p>
+          </div>
+          <p class="text-xs text-center text-gray-500 mt-4">Valido per le prossime 2 ore.</p>
+        </div>
+        
+        <div id="no-booking" class="text-center p-8 bg-gray-800/30 rounded-xl border border-gray-700 border-dashed">
+          <p class="text-gray-500">Nessuna prenotazione attiva.</p>
+        </div>
+      </div>
+
+      <!-- Box Simulatore ESP32 -->
+      <div class="glass-panel p-8 rounded-2xl relative overflow-hidden border border-gray-800 bg-black/40">
+        <div class="absolute top-0 right-0 w-1 h-full bg-orange-500"></div>
+        <h3 class="text-lg font-semibold mb-2 text-orange-400 flex justify-between items-center">
+          <span>Simulatore ESP32</span>
+          <span class="flex h-3 w-3">
+            <span class="animate-ping absolute inline-flex h-3 w-3 rounded-full bg-orange-400 opacity-75"></span>
+            <span class="relative inline-flex rounded-full h-3 w-3 bg-orange-500"></span>
+          </span>
+        </h3>
+        <p class="text-sm text-gray-400 mb-6">Simula l'inserimento del PIN sul tastierino fisico dell'armadietto.</p>
+        
+        <div class="space-y-4">
+          <div>
+            <label class="block text-xs font-semibold text-gray-400 uppercase mb-1">Seleziona Locker ID</label>
+            <select id="sim-locker-id" class="w-full bg-gray-900 border border-gray-700 rounded-lg px-4 py-2 text-sm focus:ring-2 focus:ring-orange-500 outline-none transition"></select>
+          </div>
+          <div>
+            <label class="block text-xs font-semibold text-gray-400 uppercase mb-1">Inserisci PIN</label>
+            <input type="text" id="sim-pin" placeholder="Es. 4915" maxlength="8" class="w-full bg-gray-900 border border-gray-700 rounded-lg px-4 py-3 text-xl font-mono tracking-widest text-center focus:ring-2 focus:ring-orange-500 outline-none transition">
+          </div>
+          <button onclick="simulateEsp32()" id="sim-btn" class="w-full bg-orange-600 hover:bg-orange-500 text-white font-semibold py-3 rounded-lg shadow-[0_0_15px_rgba(234,88,12,0.3)] hover:shadow-[0_0_25px_rgba(234,88,12,0.5)] transition duration-300">
+            Sblocca Armadietto
+          </button>
+        </div>
+
+        <!-- Risultato Simulatore -->
+        <div id="sim-result" class="mt-4 hidden p-3 rounded-lg text-center text-sm font-semibold transition-all"></div>
+      </div>
+
+    </section>
+  </main>
+
+  <script src="app.js"></script>
+</body>
+</html>
