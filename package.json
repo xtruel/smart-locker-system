@@ -3,6 +3,9 @@
   "version": "1.0.0",
   "description": "Smart Locker System - Backend + Frontend",
   "type": "module",
+  "bin": {
+    "nmpm": "./nmpm.js"
+  },
   "scripts": {
     "start": "node backend/src/server.js",
     "build": "cd backend && npm install",
