@@ -38,112 +38,256 @@ const supabase = createClient(
 const generatePin = () => Math.floor(1000 + Math.random() * 9000).toString();
 
 // ============================================================================
+// API KEY MIDDLEWARE — Protegge /command/*
+// ============================================================================
+// Se la env var COMMAND_API_KEY NON e' impostata, gli endpoint sono aperti
+// (comportamento storico — backward compat per migrazione graduale). Appena
+// la key viene settata su Render, TUTTI i client (frontend + tablet) devono
+// inviarla via header `x-api-key` oppure query string `?key=...`.
+//
+// Anti-brute-force leggero: timing-safe compare + log dei tentativi falliti.
+// ============================================================================
+const API_KEY = (process.env.COMMAND_API_KEY || '').trim();
+const API_KEY_REQUIRED = API_KEY.length > 0;
+
+function timingSafeEqualStr(a, b) {
+  if (a.length !== b.length) return false;
+  let diff = 0;
+  for (let i = 0; i < a.length; i++) diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  return diff === 0;
+}
+
+function requireApiKey(req, res, next) {
+  if (!API_KEY_REQUIRED) return next();
+  const provided = (
+    req.get('x-api-key') ||
+    req.query.key ||
+    ''
+  ).toString();
+  if (provided && timingSafeEqualStr(provided, API_KEY)) return next();
+  console.warn(
+    `🔐 [auth] Rifiutata richiesta ${req.method} ${req.path} da ${req.ip} (key ${provided ? 'errata' : 'mancante'})`
+  );
+  return res.status(401).json({
+    success: false,
+    error: 'Unauthorized: x-api-key header mancante o errato',
+  });
+}
+
+console.log(
+  API_KEY_REQUIRED
+    ? '🔐 API key richiesta su /command/* (COMMAND_API_KEY configurata)'
+    : '⚠️  API key NON configurata — /command/* aperti a tutti (dev mode)'
+);
+
+// ============================================================================
 // COMMAND QUEUE — Ponte Web UI ⇄ Tablet Android (RS485 relay board)
 // ============================================================================
-// La Web UI (cyber-lock-charm) chiama POST /command/push con { channel: "CHx" }.
-// Il tablet Android fa polling GET /command/pull ogni 1-2 secondi.
-// Se c'è un comando in coda, viene consumato (FIFO) e il tablet attiva il relè.
-// Nessuna persistenza: coda in memoria, cooldown anti-raffica, dedup rapido.
+// Architettura multi-tablet:
+//   - Ogni tablet si identifica con un deviceId (es. "tablet-main",
+//     "tablet-hub-roma", "tablet-cold-zone").
+//   - POST /command/push include deviceId target (default "tablet-main" per
+//     backward compat con vecchi client che non lo specificano).
+//   - GET /command/pull?deviceId=xyz consuma SOLO i comandi destinati a quel
+//     deviceId. Chi non specifica deviceId riceve la coda "tablet-main".
+//   - Heartbeat automatico: ogni /command/pull aggiorna lastSeen del device.
+//     GET /devices mostra lo stato online/offline di tutti i tablet noti.
+//   - POST /command/ack registra il risultato effettivo (TX-USB riuscito?).
+//   - Nessuna persistenza: tutto in memoria, resiste solo a piccoli riavvi.
 // ============================================================================
 
-const commandQueue = [];
-const MAX_QUEUE = 100;
+// Coda partizionata per deviceId.  Map<deviceId, Array<Command>>.
+const commandQueues = new Map();
+const MAX_QUEUE_PER_DEVICE = 100;
 const VALID_CHANNELS = new Set(
   Array.from({ length: 12 }, (_, i) => `CH${i + 1}`)
 );
-let lastPushAt = 0;
+const VALID_DEVICE_ID = /^[a-zA-Z0-9_-]{1,64}$/;
+const DEFAULT_DEVICE_ID = 'tablet-main';
+
+// Cooldown per-device (non globale) così due tablet non si blocchino a vicenda.
+const lastPushAtByDevice = new Map();
 const PUSH_COOLDOWN_MS = 500;
 
-// Storico ultimi 50 comandi consumati (per debug/log web)
+// Device registry. Map<deviceId, { firstSeen, lastSeen, lastPull, lastAck,
+//   pulls, acksOk, acksFailed }>
+const deviceRegistry = new Map();
+const DEVICE_OFFLINE_MS = 15_000; // considero offline dopo 15s senza pull
+
+// Storico ultimi 50 comandi consumati (globale, con deviceId dentro).
 const commandHistory = [];
 const MAX_HISTORY = 50;
 
+function touchDevice(deviceId, kind) {
+  const now = Date.now();
+  let d = deviceRegistry.get(deviceId);
+  if (!d) {
+    d = {
+      deviceId,
+      firstSeen: now,
+      lastSeen: now,
+      lastPull: null,
+      lastAck: null,
+      pulls: 0,
+      acksOk: 0,
+      acksFailed: 0,
+    };
+    deviceRegistry.set(deviceId, d);
+  }
+  d.lastSeen = now;
+  if (kind === 'pull') { d.lastPull = now; d.pulls++; }
+  if (kind === 'ack-ok') { d.lastAck = now; d.acksOk++; }
+  if (kind === 'ack-failed') { d.lastAck = now; d.acksFailed++; }
+}
+
+function getQueue(deviceId) {
+  if (!commandQueues.has(deviceId)) commandQueues.set(deviceId, []);
+  return commandQueues.get(deviceId);
+}
+
 /**
  * POST /command/push
- * Body: { channel: "CH1"|...|"CH12", lockerId?: string, pin?: string, source?: string }
- * Ritorna: { success, queued, queueLength }
+ * Body: { channel, deviceId?, lockerId?, pin?, source? }
+ * Se deviceId non specificato → "tablet-main" (back-compat).
  */
-app.post('/command/push', (req, res) => {
-  const { channel, lockerId, pin, source } = req.body || {};
+app.post('/command/push', requireApiKey, (req, res) => {
+  const { channel, deviceId, lockerId, pin, source } = req.body || {};
   if (!channel || !VALID_CHANNELS.has(channel)) {
     return res.status(400).json({
       success: false,
       error: 'channel richiesto: CH1..CH12',
     });
   }
-  const now = Date.now();
-  if (now - lastPushAt < PUSH_COOLDOWN_MS) {
-    return res.status(429).json({
+  const device = deviceId || DEFAULT_DEVICE_ID;
+  if (!VALID_DEVICE_ID.test(device)) {
+    return res.status(400).json({
       success: false,
-      error: `Cooldown ${PUSH_COOLDOWN_MS}ms anti-raffica`,
+      error: 'deviceId non valido (a-z A-Z 0-9 _ - 1..64 char)',
     });
   }
-  lastPushAt = now;
+  const now = Date.now();
+  const lastForDev = lastPushAtByDevice.get(device) || 0;
+  if (now - lastForDev < PUSH_COOLDOWN_MS) {
+    return res.status(429).json({
+      success: false,
+      error: `Cooldown ${PUSH_COOLDOWN_MS}ms anti-raffica per ${device}`,
+    });
+  }
+  lastPushAtByDevice.set(device, now);
 
   const cmd = {
     id: `cmd-${now}-${Math.random().toString(36).slice(2, 7)}`,
     channel,
+    deviceId: device,
     lockerId: lockerId || null,
     pin: pin || null,
     source: source || 'web',
     pushedAt: new Date(now).toISOString(),
   };
-  commandQueue.push(cmd);
-  if (commandQueue.length > MAX_QUEUE) commandQueue.shift();
+  const q = getQueue(device);
+  q.push(cmd);
+  if (q.length > MAX_QUEUE_PER_DEVICE) q.shift();
 
-  console.log(`📤 [command/push] ${channel} · src=${cmd.source} · queue=${commandQueue.length}`);
-  res.json({ success: true, queued: cmd, queueLength: commandQueue.length });
+  console.log(
+    `📤 [command/push] ${channel} → ${device} · src=${cmd.source} · queue=${q.length}`
+  );
+  res.json({ success: true, queued: cmd, queueLength: q.length });
 });
 
 /**
- * GET /command/pull
- * Il tablet Android polla questo endpoint. Consuma UN comando dalla coda.
- * Ritorna: { command: {...} } oppure { command: null }
+ * GET /command/pull?deviceId=xyz
+ * Il tablet specifica chi è. Serve il suo comando in testa alla coda.
+ * Aggiorna anche lastSeen (usato da /devices per stato online/offline).
  */
-app.get('/command/pull', (req, res) => {
-  if (commandQueue.length === 0) {
+app.get('/command/pull', requireApiKey, (req, res) => {
+  const device = (req.query.deviceId || DEFAULT_DEVICE_ID).toString();
+  if (!VALID_DEVICE_ID.test(device)) {
+    return res.status(400).json({ command: null, error: 'deviceId non valido' });
+  }
+  touchDevice(device, 'pull');
+  const q = getQueue(device);
+  if (q.length === 0) {
     return res.json({ command: null });
   }
-  const cmd = commandQueue.shift();
+  const cmd = q.shift();
   const consumed = {
     ...cmd,
     pulledAt: new Date().toISOString(),
   };
   commandHistory.unshift(consumed);
   if (commandHistory.length > MAX_HISTORY) commandHistory.pop();
-  console.log(`📥 [command/pull] tablet ha consumato ${cmd.channel}`);
+  console.log(`📥 [command/pull] ${device} ha consumato ${cmd.channel}`);
   res.json({ command: consumed });
 });
 
 /**
  * GET /command/status
- * Debug: stato coda corrente + ultimi comandi consumati.
+ * Stato globale: code per-device + history recente + devices noti.
  */
-app.get('/command/status', (req, res) => {
+app.get('/command/status', requireApiKey, (req, res) => {
+  const queues = {};
+  for (const [dev, q] of commandQueues.entries()) queues[dev] = q;
   res.json({
-    queueLength: commandQueue.length,
-    queue: commandQueue,
+    queues,
     history: commandHistory.slice(0, 20),
+    devices: Array.from(deviceRegistry.values()).map(snapshotDevice),
   });
 });
 
 /**
  * POST /command/ack
- * Il tablet conferma di aver eseguito un comando (opzionale, solo per logging).
- * Body: { id, channel, result: "success"|"error", message? }
+ * Tablet conferma esito reale. Body:
+ *   { id, channel, deviceId, result: "success"|"failed"|"invalid", message? }
  */
-app.post('/command/ack', (req, res) => {
-  const { id, channel, result, message } = req.body || {};
-  console.log(`✅ [command/ack] ${channel || id} · ${result || 'ok'} · ${message || ''}`);
+app.post('/command/ack', requireApiKey, (req, res) => {
+  const { id, channel, deviceId, result, message } = req.body || {};
+  const device = deviceId || DEFAULT_DEVICE_ID;
+  const ok = result === 'success';
+  touchDevice(device, ok ? 'ack-ok' : 'ack-failed');
+  console.log(
+    `${ok ? '✅' : '❌'} [command/ack] ${device} · ${channel || id} · ${result || 'ok'} · ${message || ''}`
+  );
   res.json({ success: true });
 });
 
+/**
+ * GET /devices
+ * Ritorna la lista di tutti i tablet che si sono collegati almeno una volta,
+ * con lo stato online/offline calcolato dall'ultimo pull.
+ */
+app.get('/devices', (req, res) => {
+  res.json({
+    devices: Array.from(deviceRegistry.values()).map(snapshotDevice),
+  });
+});
+
+function snapshotDevice(d) {
+  const now = Date.now();
+  const age = d.lastSeen ? now - d.lastSeen : null;
+  return {
+    deviceId: d.deviceId,
+    online: age !== null && age < DEVICE_OFFLINE_MS,
+    lastSeenMs: age,
+    firstSeen: new Date(d.firstSeen).toISOString(),
+    lastSeen: d.lastSeen ? new Date(d.lastSeen).toISOString() : null,
+    lastPull: d.lastPull ? new Date(d.lastPull).toISOString() : null,
+    lastAck: d.lastAck ? new Date(d.lastAck).toISOString() : null,
+    pulls: d.pulls,
+    acksOk: d.acksOk,
+    acksFailed: d.acksFailed,
+    queued: (commandQueues.get(d.deviceId) || []).length,
+  };
+}
+
 // Health check endpoint (utile per Render per verificare che il server sia vivo)
 app.get('/health', (req, res) => {
+  let totalQueued = 0;
+  for (const q of commandQueues.values()) totalQueued += q.length;
   res.json({
     status: 'ok',
     timestamp: new Date().toISOString(),
-    commandQueue: commandQueue.length,
+    queuedCommands: totalQueued,
+    knownDevices: deviceRegistry.size,
   });
 });
 
