@@ -37,9 +37,114 @@ const supabase = createClient(
 // Helper: Genera un PIN a 4 cifre random
 const generatePin = () => Math.floor(1000 + Math.random() * 9000).toString();
 
+// ============================================================================
+// COMMAND QUEUE — Ponte Web UI ⇄ Tablet Android (RS485 relay board)
+// ============================================================================
+// La Web UI (cyber-lock-charm) chiama POST /command/push con { channel: "CHx" }.
+// Il tablet Android fa polling GET /command/pull ogni 1-2 secondi.
+// Se c'è un comando in coda, viene consumato (FIFO) e il tablet attiva il relè.
+// Nessuna persistenza: coda in memoria, cooldown anti-raffica, dedup rapido.
+// ============================================================================
+
+const commandQueue = [];
+const MAX_QUEUE = 100;
+const VALID_CHANNELS = new Set(
+  Array.from({ length: 12 }, (_, i) => `CH${i + 1}`)
+);
+let lastPushAt = 0;
+const PUSH_COOLDOWN_MS = 500;
+
+// Storico ultimi 50 comandi consumati (per debug/log web)
+const commandHistory = [];
+const MAX_HISTORY = 50;
+
+/**
+ * POST /command/push
+ * Body: { channel: "CH1"|...|"CH12", lockerId?: string, pin?: string, source?: string }
+ * Ritorna: { success, queued, queueLength }
+ */
+app.post('/command/push', (req, res) => {
+  const { channel, lockerId, pin, source } = req.body || {};
+  if (!channel || !VALID_CHANNELS.has(channel)) {
+    return res.status(400).json({
+      success: false,
+      error: 'channel richiesto: CH1..CH12',
+    });
+  }
+  const now = Date.now();
+  if (now - lastPushAt < PUSH_COOLDOWN_MS) {
+    return res.status(429).json({
+      success: false,
+      error: `Cooldown ${PUSH_COOLDOWN_MS}ms anti-raffica`,
+    });
+  }
+  lastPushAt = now;
+
+  const cmd = {
+    id: `cmd-${now}-${Math.random().toString(36).slice(2, 7)}`,
+    channel,
+    lockerId: lockerId || null,
+    pin: pin || null,
+    source: source || 'web',
+    pushedAt: new Date(now).toISOString(),
+  };
+  commandQueue.push(cmd);
+  if (commandQueue.length > MAX_QUEUE) commandQueue.shift();
+
+  console.log(`📤 [command/push] ${channel} · src=${cmd.source} · queue=${commandQueue.length}`);
+  res.json({ success: true, queued: cmd, queueLength: commandQueue.length });
+});
+
+/**
+ * GET /command/pull
+ * Il tablet Android polla questo endpoint. Consuma UN comando dalla coda.
+ * Ritorna: { command: {...} } oppure { command: null }
+ */
+app.get('/command/pull', (req, res) => {
+  if (commandQueue.length === 0) {
+    return res.json({ command: null });
+  }
+  const cmd = commandQueue.shift();
+  const consumed = {
+    ...cmd,
+    pulledAt: new Date().toISOString(),
+  };
+  commandHistory.unshift(consumed);
+  if (commandHistory.length > MAX_HISTORY) commandHistory.pop();
+  console.log(`📥 [command/pull] tablet ha consumato ${cmd.channel}`);
+  res.json({ command: consumed });
+});
+
+/**
+ * GET /command/status
+ * Debug: stato coda corrente + ultimi comandi consumati.
+ */
+app.get('/command/status', (req, res) => {
+  res.json({
+    queueLength: commandQueue.length,
+    queue: commandQueue,
+    history: commandHistory.slice(0, 20),
+  });
+});
+
+/**
+ * POST /command/ack
+ * Il tablet conferma di aver eseguito un comando (opzionale, solo per logging).
+ * Body: { id, channel, result: "success"|"error", message? }
+ */
+app.post('/command/ack', (req, res) => {
+  const { id, channel, result, message } = req.body || {};
+  console.log(`✅ [command/ack] ${channel || id} · ${result || 'ok'} · ${message || ''}`);
+  res.json({ success: true });
+});
+
 // Health check endpoint (utile per Render per verificare che il server sia vivo)
 app.get('/health', (req, res) => {
-  res.json({ status: 'ok', timestamp: new Date().toISOString() });
+  res.json({
+    status: 'ok',
+    timestamp: new Date().toISOString(),
+    commandQueue: commandQueue.length,
+  });
 });
 
 /**
