@@ -81,6 +81,65 @@ console.log(
 );
 
 // ============================================================================
+// AUDIT LOG PERSISTENTE (Supabase) — opt-in, degrada gracefully
+// ============================================================================
+// Se la tabella `audit_events` e le colonne estese di `access_logs` esistono
+// (migration 001_audit_and_roles.sql applicata), i log vengono scritti anche
+// su DB. Altrimenti fail silenziosamente e si continua con i log in-memory.
+// ============================================================================
+
+const SUPABASE_CONFIGURED = !!(
+  process.env.SUPABASE_URL && process.env.SUPABASE_SERVICE_KEY
+);
+
+/** Scrive un evento su audit_events. Best-effort, non blocca mai. */
+async function logAuditEvent(event) {
+  if (!SUPABASE_CONFIGURED) return;
+  try {
+    await supabase.from('audit_events').insert([
+      {
+        event_type: event.event_type,
+        actor: event.actor || null,
+        subject: event.subject || null,
+        result: event.result || 'info',
+        message: event.message || null,
+        metadata: event.metadata || null,
+      },
+    ]);
+  } catch (err) {
+    // Log fallito — probabilmente tabella non ancora creata. Skip.
+    if (process.env.DEBUG_AUDIT) {
+      console.warn('[audit] insert failed:', err.message || err);
+    }
+  }
+}
+
+/** Upsert del device registry su DB. Best-effort. */
+async function persistDeviceState(deviceId, patch) {
+  if (!SUPABASE_CONFIGURED) return;
+  try {
+    const d = deviceRegistry.get(deviceId);
+    if (!d) return;
+    await supabase.from('devices').upsert(
+      {
+        device_id: deviceId,
+        last_seen: d.lastSeen ? new Date(d.lastSeen).toISOString() : null,
+        last_pull: d.lastPull ? new Date(d.lastPull).toISOString() : null,
+        last_ack: d.lastAck ? new Date(d.lastAck).toISOString() : null,
+        total_pulls: d.pulls,
+        total_acks_ok: d.acksOk,
+        total_acks_failed: d.acksFailed,
+      },
+      { onConflict: 'device_id' }
+    );
+  } catch (err) {
+    if (process.env.DEBUG_AUDIT) {
+      console.warn('[audit] device upsert failed:', err.message || err);
+    }
+  }
+}
+
+// ============================================================================
 // COMMAND QUEUE — Ponte Web UI ⇄ Tablet Android (RS485 relay board)
 // ============================================================================
 // Architettura multi-tablet:
@@ -191,6 +250,15 @@ app.post('/command/push', requireApiKey, (req, res) => {
   console.log(
     `📤 [command/push] ${channel} → ${device} · src=${cmd.source} · queue=${q.length}`
   );
+  // Audit (non-blocking)
+  logAuditEvent({
+    event_type: 'command_push',
+    actor: cmd.source,
+    subject: device,
+    result: 'info',
+    message: `${channel} queued for ${device}`,
+    metadata: { channel, lockerId: cmd.lockerId, cmdId: cmd.id },
+  });
   res.json({ success: true, queued: cmd, queueLength: q.length });
 });
 
@@ -217,6 +285,16 @@ app.get('/command/pull', requireApiKey, (req, res) => {
   commandHistory.unshift(consumed);
   if (commandHistory.length > MAX_HISTORY) commandHistory.pop();
   console.log(`📥 [command/pull] ${device} ha consumato ${cmd.channel}`);
+  // Audit + persist device state (non-blocking)
+  logAuditEvent({
+    event_type: 'command_pull',
+    actor: device,
+    subject: cmd.lockerId,
+    result: 'info',
+    message: `${device} pulled ${cmd.channel}`,
+    metadata: { channel: cmd.channel, cmdId: cmd.id },
+  });
+  persistDeviceState(device);
   res.json({ command: consumed });
 });
 
@@ -247,6 +325,16 @@ app.post('/command/ack', requireApiKey, (req, res) => {
   console.log(
     `${ok ? '✅' : '❌'} [command/ack] ${device} · ${channel || id} · ${result || 'ok'} · ${message || ''}`
   );
+  // Audit + persist (non-blocking)
+  logAuditEvent({
+    event_type: 'command_ack',
+    actor: device,
+    subject: channel,
+    result: ok ? 'success' : 'failed',
+    message: message || null,
+    metadata: { cmdId: id, channel },
+  });
+  persistDeviceState(device);
   res.json({ success: true });
 });
 
@@ -278,6 +366,53 @@ function snapshotDevice(d) {
     queued: (commandQueues.get(d.deviceId) || []).length,
   };
 }
+
+/**
+ * POST /audit/log
+ * Permette a frontend / tablet di registrare un evento nel DB (persistente).
+ * Se Supabase non configurata ritorna success:false ma non 500.
+ * Protetto da API key (se configurata).
+ */
+app.post('/audit/log', requireApiKey, async (req, res) => {
+  if (!SUPABASE_CONFIGURED) {
+    return res.json({ success: false, persisted: false, reason: 'supabase-not-configured' });
+  }
+  const { event_type, actor, subject, result, message, metadata } = req.body || {};
+  if (!event_type) {
+    return res.status(400).json({ success: false, error: 'event_type required' });
+  }
+  await logAuditEvent({ event_type, actor, subject, result, message, metadata });
+  res.json({ success: true, persisted: true });
+});
+
+/**
+ * GET /audit/logs?limit=100&eventType=command_ack&since=2026-05-01
+ * Legge gli eventi persistenti. Protetto da API key.
+ * NOTA: in futuro, sostituire API key con JWT Supabase + role-check admin.
+ */
+app.get('/audit/logs', requireApiKey, async (req, res) => {
+  if (!SUPABASE_CONFIGURED) {
+    return res.json({ events: [], reason: 'supabase-not-configured' });
+  }
+  try {
+    const limit = Math.min(parseInt(req.query.limit) || 100, 1000);
+    const eventType = req.query.eventType;
+    const since = req.query.since;
+    let q = supabase
+      .from('audit_events')
+      .select('*')
+      .order('ts', { ascending: false })
+      .limit(limit);
+    if (eventType) q = q.eq('event_type', eventType);
+    if (since) q = q.gte('ts', since);
+    const { data, error } = await q;
+    if (error) throw error;
+    res.json({ events: data || [] });
+  } catch (err) {
+    console.error('[audit/logs] error:', err.message || err);
+    res.status(500).json({ error: 'Failed to read audit logs' });
+  }
+});
 
 // Health check endpoint (utile per Render per verificare che il server sia vivo)
 app.get('/health', (req, res) => {
