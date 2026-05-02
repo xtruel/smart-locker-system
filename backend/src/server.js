@@ -548,6 +548,283 @@ app.get('/lockers', async (req, res) => {
   }
 });
 
+// ============================================================================
+// CUSTOMER ENDPOINTS — Portale clienti finali
+// ============================================================================
+// Design note: Supabase Auth gestisce email+password (tramite GoTrue REST).
+// Il frontend cliente si autentica direttamente con Supabase e ottiene un
+// access_token JWT che invia in Authorization: Bearer <token> ad ogni
+// chiamata ai nostri endpoint protetti. Noi validiamo il JWT chiamando
+// l'endpoint /auth/v1/user di Supabase (che riconosce la anon key + token).
+// ============================================================================
+
+/**
+ * Valida un JWT Supabase estraendo l'utente. Ritorna null se non valido.
+ * Cache-less (per semplicita'); accettabile perche' le chiamate customer
+ * sono poche e non time-critical.
+ */
+async function resolveSupabaseUser(req) {
+  const auth = req.get('Authorization') || '';
+  const token = auth.startsWith('Bearer ') ? auth.slice(7) : '';
+  if (!token) return null;
+  if (!process.env.SUPABASE_URL) return null;
+  try {
+    const res = await fetch(`${process.env.SUPABASE_URL}/auth/v1/user`, {
+      headers: {
+        apikey: process.env.SUPABASE_ANON_KEY || process.env.SUPABASE_SERVICE_KEY,
+        Authorization: `Bearer ${token}`,
+      },
+    });
+    if (!res.ok) return null;
+    return await res.json();
+  } catch {
+    return null;
+  }
+}
+
+/** Middleware: richiede utente autenticato. Popola req.user. */
+async function requireUser(req, res, next) {
+  const user = await resolveSupabaseUser(req);
+  if (!user || !user.id) {
+    return res.status(401).json({ error: 'Unauthorized: JWT mancante o scaduto' });
+  }
+  req.user = user;
+  next();
+}
+
+/** Middleware: richiede ruolo (admin|operator). Usa user_roles dal DB. */
+function requireRole(allowed) {
+  return async (req, res, next) => {
+    const user = await resolveSupabaseUser(req);
+    if (!user) return res.status(401).json({ error: 'Unauthorized' });
+    try {
+      const { data, error } = await supabase
+        .from('user_roles')
+        .select('role')
+        .eq('user_id', user.id)
+        .maybeSingle();
+      if (error) throw error;
+      const role = data?.role || 'customer';
+      if (!allowed.includes(role)) {
+        return res.status(403).json({ error: `Ruolo ${role} non autorizzato` });
+      }
+      req.user = user;
+      req.role = role;
+      next();
+    } catch (err) {
+      console.error('[requireRole]', err);
+      return res.status(500).json({ error: 'Role check failed' });
+    }
+  };
+}
+
+/**
+ * POST /customer/register
+ * Body: { email, password, full_name? }
+ * Crea un utente Supabase Auth + assegna role='customer' in user_roles.
+ * Se Supabase Auth non configurato, ritorna 503 (feature non disponibile).
+ */
+app.post('/customer/register', async (req, res) => {
+  const { email, password, full_name } = req.body || {};
+  if (!email || !password) {
+    return res.status(400).json({ error: 'email e password richiesti' });
+  }
+  if (!process.env.SUPABASE_URL || !process.env.SUPABASE_SERVICE_KEY) {
+    return res.status(503).json({
+      error: 'Registrazione non disponibile: Supabase non configurato',
+    });
+  }
+  try {
+    // Crea utente auth con admin API (auto-confirmed per semplicita' demo)
+    const createRes = await fetch(`${process.env.SUPABASE_URL}/auth/v1/admin/users`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        apikey: process.env.SUPABASE_SERVICE_KEY,
+        Authorization: `Bearer ${process.env.SUPABASE_SERVICE_KEY}`,
+      },
+      body: JSON.stringify({
+        email,
+        password,
+        email_confirm: true,
+        user_metadata: full_name ? { full_name } : undefined,
+      }),
+    });
+    if (!createRes.ok) {
+      const err = await createRes.json().catch(() => ({}));
+      return res.status(400).json({
+        error: err.msg || err.error || `Registrazione fallita (HTTP ${createRes.status})`,
+      });
+    }
+    const newUser = await createRes.json();
+    // Assegna ruolo customer (best-effort, la tabella potrebbe non esistere in dev)
+    try {
+      await supabase
+        .from('user_roles')
+        .upsert({ user_id: newUser.id, role: 'customer' }, { onConflict: 'user_id' });
+    } catch {
+      /* ignore */
+    }
+    logAuditEvent({
+      event_type: 'customer_register',
+      actor: email,
+      subject: newUser.id,
+      result: 'success',
+      message: `New customer registered: ${email}`,
+    });
+    return res.json({ success: true, user: { id: newUser.id, email: newUser.email } });
+  } catch (err) {
+    console.error('[customer/register]', err);
+    return res.status(500).json({ error: 'Registrazione fallita' });
+  }
+});
+
+/**
+ * GET /customer/lockers/available
+ * Elenco celle disponibili (status='available'). Pubblico: serve per la
+ * landing customer senza login. In futuro filtrare per site/zone.
+ */
+app.get('/customer/lockers/available', async (req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from('lockers')
+      .select('id, location, status')
+      .eq('status', 'available');
+    if (error) throw error;
+    res.json({ lockers: data || [] });
+  } catch (err) {
+    console.error('[customer/lockers/available]', err);
+    res.status(500).json({ error: 'Failed to fetch lockers' });
+  }
+});
+
+/**
+ * POST /customer/book
+ * Body: { locker_id, duration_hours }
+ * Crea booking per l'utente loggato. Ritorna PIN.
+ * Richiede JWT Supabase valido.
+ */
+app.post('/customer/book', requireUser, async (req, res) => {
+  const { locker_id, duration_hours } = req.body || {};
+  if (!locker_id || !duration_hours) {
+    return res.status(400).json({ error: 'locker_id e duration_hours richiesti' });
+  }
+  const hrs = Math.min(Math.max(parseFloat(duration_hours) || 0, 0.5), 48);
+  if (hrs <= 0) return res.status(400).json({ error: 'duration_hours non valida' });
+
+  try {
+    const pin = generatePin();
+    const startTime = new Date();
+    const endTime = new Date(startTime.getTime() + hrs * 60 * 60 * 1000);
+
+    const { data, error } = await supabase
+      .from('bookings')
+      .insert([
+        {
+          user_id: req.user.id,
+          locker_id,
+          start_time: startTime.toISOString(),
+          end_time: endTime.toISOString(),
+          pin_code: pin,
+          status: 'active',
+        },
+      ])
+      .select()
+      .single();
+    if (error) throw error;
+
+    logAuditEvent({
+      event_type: 'customer_book',
+      actor: req.user.email,
+      subject: locker_id,
+      result: 'success',
+      message: `Customer booked locker for ${hrs}h`,
+      metadata: { bookingId: data.id, pin },
+    });
+
+    res.json({ success: true, booking: data, pin });
+  } catch (err) {
+    console.error('[customer/book]', err);
+    res.status(500).json({ error: 'Booking failed' });
+  }
+});
+
+/**
+ * GET /customer/bookings
+ * Ritorna le prenotazioni dell'utente loggato (active + history).
+ */
+app.get('/customer/bookings', requireUser, async (req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from('bookings')
+      .select('*, lockers(location)')
+      .eq('user_id', req.user.id)
+      .order('start_time', { ascending: false })
+      .limit(100);
+    if (error) throw error;
+    res.json({ bookings: data || [] });
+  } catch (err) {
+    console.error('[customer/bookings]', err);
+    res.status(500).json({ error: 'Failed to fetch bookings' });
+  }
+});
+
+/**
+ * POST /customer/bookings/:id/cancel
+ * Cancella una prenotazione attiva dell'utente. Solo il proprietario.
+ */
+app.post('/customer/bookings/:id/cancel', requireUser, async (req, res) => {
+  const { id } = req.params;
+  try {
+    // Verifica ownership
+    const { data: b, error: e1 } = await supabase
+      .from('bookings')
+      .select('user_id, status')
+      .eq('id', id)
+      .maybeSingle();
+    if (e1) throw e1;
+    if (!b) return res.status(404).json({ error: 'Booking non trovata' });
+    if (b.user_id !== req.user.id) return res.status(403).json({ error: 'Non autorizzato' });
+    if (b.status !== 'active') return res.status(400).json({ error: 'Booking gia\' chiusa' });
+
+    const { error } = await supabase
+      .from('bookings')
+      .update({ status: 'cancelled' })
+      .eq('id', id);
+    if (error) throw error;
+    logAuditEvent({
+      event_type: 'customer_cancel',
+      actor: req.user.email,
+      subject: id,
+      result: 'success',
+    });
+    res.json({ success: true });
+  } catch (err) {
+    console.error('[customer/bookings/:id/cancel]', err);
+    res.status(500).json({ error: 'Cancel failed' });
+  }
+});
+
+// ============================================================================
+// ADMIN ENDPOINTS — protetti da ruolo admin via JWT
+// ============================================================================
+
+/** GET /admin/bookings — tutte le prenotazioni. */
+app.get('/admin/bookings', requireRole(['admin', 'operator']), async (req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from('bookings')
+      .select('*, lockers(location), users:user_id')
+      .order('start_time', { ascending: false })
+      .limit(500);
+    if (error) throw error;
+    res.json({ bookings: data || [] });
+  } catch (err) {
+    console.error('[admin/bookings]', err);
+    res.status(500).json({ error: 'Failed to fetch bookings' });
+  }
+});
+
 // Fallback: serve index.html per qualsiasi route non trovata (SPA-style)
 app.get('*', (req, res) => {
   res.sendFile(path.join(publicPath, 'index.html'));
