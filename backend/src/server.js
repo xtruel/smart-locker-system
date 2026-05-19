@@ -1063,6 +1063,131 @@ app.get('/reservation/:code', rateLimit('reservation', 20), async (req, res) => 
 });
 
 // ============================================================================
+// UNLOCK BY CODE — endpoint per scanner QR sul tablet (e qualunque kiosk)
+// ============================================================================
+// Il client (app Android col QR, oppure web kiosk) manda SOLO il codice LCK
+// dello scontrino/QR. Il server:
+//   1. risolve la booking
+//   2. legge PIN, locker, channel, device_id dal DB (mai esposti al client)
+//   3. accoda il comando di apertura
+//   4. risponde solo success/failed + descrizione cella (senza PIN)
+//
+// In questo modo:
+//   - Il PIN non lascia mai il backend (il client non lo conosce neanche)
+//   - Brute-force richiede di INDOVINARE il codice (16384 combi su 4 hex)
+//     contro il rate limit unlockByCode (15/min/IP), invece di poter
+//     leggere il PIN dopo una sola scansione fortunata
+// ============================================================================
+app.post(
+  '/unlock-by-code',
+  rateLimit('unlock_code', 15),
+  requireApiKey,
+  async (req, res) => {
+    const code = (req.body?.code || '').trim().toUpperCase();
+    if (!RESERVATION_CODE_RE.test(code)) {
+      return res.status(400).json({ success: false, error: 'Codice non valido' });
+    }
+    if (!SUPABASE_CONFIGURED) {
+      return res.status(503).json({ success: false, error: 'DB non configurato' });
+    }
+    const suffix = code.slice(4).toLowerCase();
+    try {
+      const { data: bookings, error: bErr } = await supabase.rpc(
+        'find_booking_by_code',
+        { code_suffix: suffix }
+      );
+      if (bErr) throw bErr;
+      if (!bookings || bookings.length === 0) {
+        logAuditEvent({
+          event_type: 'unlock_code_denied',
+          actor: 'qr-scanner',
+          subject: code,
+          result: 'failed',
+          message: 'Reservation not found',
+        });
+        return res.status(404).json({ success: false, error: 'Prenotazione non trovata' });
+      }
+      const b = bookings.find((x) => x.status === 'active') || bookings[0];
+      const nowMs = Date.now();
+      if (b.status !== 'active') {
+        return res.status(409).json({ success: false, error: 'Prenotazione non attiva' });
+      }
+      if (new Date(b.end_time).getTime() < nowMs) {
+        return res.status(410).json({ success: false, error: 'Prenotazione scaduta' });
+      }
+      if (new Date(b.start_time).getTime() > nowMs) {
+        return res.status(425).json({
+          success: false,
+          error: 'Prenotazione non ancora valida',
+        });
+      }
+
+      // Risolvi channel + device dal locker
+      const { data: lk, error: lErr } = await supabase
+        .from('lockers')
+        .select('location, channel, device_id')
+        .eq('id', b.locker_id)
+        .maybeSingle();
+      if (lErr) throw lErr;
+      if (!lk || !lk.channel || !VALID_CHANNELS.has(lk.channel)) {
+        return res.status(500).json({
+          success: false,
+          error: 'Locker non configurato (manca channel)',
+        });
+      }
+      const deviceTarget =
+        lk.device_id && VALID_DEVICE_ID.test(lk.device_id) ? lk.device_id : DEFAULT_DEVICE_ID;
+
+      // Cooldown anti-doppio-scan
+      const lastForDev = lastPushAtByDevice.get(deviceTarget) || 0;
+      if (nowMs - lastForDev < PUSH_COOLDOWN_MS) {
+        return res.status(429).json({
+          success: false,
+          error: 'Attendi qualche secondo e riprova',
+        });
+      }
+      lastPushAtByDevice.set(deviceTarget, nowMs);
+
+      const cmd = {
+        id: `cmd-${nowMs}-${Math.random().toString(36).slice(2, 7)}`,
+        channel: lk.channel,
+        deviceId: deviceTarget,
+        lockerId: b.locker_id,
+        pin: null, // PIN NON viaggia nel comando — gia' validato
+        source: 'qr-unlock',
+        pushedAt: new Date(nowMs).toISOString(),
+      };
+      const q = getQueue(deviceTarget);
+      q.push(cmd);
+      if (q.length > MAX_QUEUE_PER_DEVICE) q.shift();
+
+      // Audit + access log
+      logAuditEvent({
+        event_type: 'unlock_code',
+        actor: 'qr-scanner',
+        subject: code,
+        result: 'success',
+        message: `${lk.channel} queued for ${deviceTarget}`,
+        metadata: { channel: lk.channel, lockerId: b.locker_id },
+      });
+      await supabase.from('access_logs').insert([
+        { locker_id: b.locker_id, result: 'success', pin_used: 'qr-code' },
+      ]);
+
+      // Risposta volutamente minimale — NIENTE pin, niente UUID
+      res.json({
+        success: true,
+        location: lk.location || null,
+        message: `Apertura cella ${lk.location || lk.channel}`,
+      });
+    } catch (err) {
+      console.error('[unlock-by-code]', err);
+      res.status(500).json({ success: false, error: 'Apertura fallita' });
+    }
+  }
+);
+
+// ============================================================================
 // NAYAX WEBHOOK — placeholder per integrazione futura
 // ============================================================================
 // Quando il cliente di Eugenio sistemera' Nayax, qui arriveranno i webhook
