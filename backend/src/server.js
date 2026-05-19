@@ -324,7 +324,7 @@ app.post('/command/push', rateLimit('push', 60), requireApiKey, async (req, res)
       const nowIso = new Date().toISOString();
       const { data: bookings, error: bErr } = await supabase
         .from('bookings')
-        .select('id, status, start_time, end_time, lockers(channel, device_id)')
+        .select('id, status, start_time, end_time')
         .eq('locker_id', lockerId)
         .eq('pin_code', pin)
         .eq('status', 'active')
@@ -353,13 +353,23 @@ app.post('/command/push', rateLimit('push', 60), requireApiKey, async (req, res)
           error: 'PIN non valido o prenotazione scaduta',
         });
       }
-      // OVERRIDE: usa channel + device dal DB (single source of truth).
-      const lockerRow = bookings[0].lockers;
-      if (lockerRow?.channel && VALID_CHANNELS.has(lockerRow.channel)) {
-        effectiveChannel = lockerRow.channel;
-      }
-      if (lockerRow?.device_id && VALID_DEVICE_ID.test(lockerRow.device_id)) {
-        effectiveDevice = lockerRow.device_id;
+      // Override channel/device dal DB (single source of truth). Query
+      // separata per essere tolleranti al cache di PostgREST quando si
+      // aggiungono colonne nuove a lockers.
+      try {
+        const { data: lk } = await supabase
+          .from('lockers')
+          .select('channel, device_id')
+          .eq('id', lockerId)
+          .maybeSingle();
+        if (lk?.channel && VALID_CHANNELS.has(lk.channel)) {
+          effectiveChannel = lk.channel;
+        }
+        if (lk?.device_id && VALID_DEVICE_ID.test(lk.device_id)) {
+          effectiveDevice = lk.device_id;
+        }
+      } catch (e) {
+        console.warn('[command/push] no channel column yet, fallback to client value');
       }
     }
   }
@@ -994,9 +1004,11 @@ app.get('/reservation/:code', rateLimit('reservation', 20), async (req, res) => 
   try {
     // Cerca tutte le bookings il cui id finisce col suffix.
     // Postgres ilike '%xxxx' su UUID ::text. Limit 5, ordina per piu' recente.
+    // Due query separate per evitare problemi di cache schema PostgREST
+    // quando si aggiungono colonne nuove a lockers (channel/device_id).
     const { data, error } = await supabase
       .from('bookings')
-      .select('id, locker_id, pin_code, start_time, end_time, status, lockers(location, channel, device_id)')
+      .select('id, locker_id, pin_code, start_time, end_time, status')
       .ilike('id', `%${suffix}`)
       .order('start_time', { ascending: false })
       .limit(5);
@@ -1004,15 +1016,42 @@ app.get('/reservation/:code', rateLimit('reservation', 20), async (req, res) => 
     if (!data || data.length === 0) {
       return res.status(404).json({ error: 'Prenotazione non trovata' });
     }
-    // Preferisci active, altrimenti la piu' recente
     const b = data.find(x => x.status === 'active') || data[0];
+
+    // Lookup locker separato — tollerante se colonne non esistono ancora
+    let lockerLocation = null;
+    let lockerChannel = null;
+    let lockerDeviceId = null;
+    try {
+      const { data: lk } = await supabase
+        .from('lockers')
+        .select('location, channel, device_id')
+        .eq('id', b.locker_id)
+        .maybeSingle();
+      if (lk) {
+        lockerLocation = lk.location || null;
+        lockerChannel = lk.channel || null;
+        lockerDeviceId = lk.device_id || null;
+      }
+    } catch (e) {
+      // Probabile colonna non esistente — fallback su solo location
+      try {
+        const { data: lk2 } = await supabase
+          .from('lockers')
+          .select('location')
+          .eq('id', b.locker_id)
+          .maybeSingle();
+        if (lk2) lockerLocation = lk2.location || null;
+      } catch { /* ignore */ }
+    }
+
     res.json({
       reservation_code: code,
       booking_id: b.id,
       locker_id: b.locker_id,
-      locker_location: b.lockers?.location || null,
-      locker_channel: b.lockers?.channel || null,
-      locker_device_id: b.lockers?.device_id || null,
+      locker_location: lockerLocation,
+      locker_channel: lockerChannel,
+      locker_device_id: lockerDeviceId,
       pin_code: b.pin_code,
       start_time: b.start_time,
       end_time: b.end_time,
