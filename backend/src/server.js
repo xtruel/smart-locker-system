@@ -984,7 +984,10 @@ app.get('/admin/bookings', requireRole(['admin', 'operator']), async (req, res) 
 // reservation_code e si modifica la lookup.
 // ============================================================================
 
-const RESERVATION_CODE_RE = /^LCK-[A-F0-9]{4}$/i;
+// Codice prenotazione LCK-XXXXXXXX: 8 caratteri esadecimali = ~4 miliardi
+// di combinazioni. Derivato dagli ultimi 8 hex del booking UUID (32 hex
+// totali). Brute-force pratico impossibile col rate limit 15/min.
+const RESERVATION_CODE_RE = /^LCK-[A-F0-9]{8}$/i;
 
 /**
  * GET /reservation/:code
