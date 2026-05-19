@@ -10,8 +10,80 @@ dotenv.config();
 dotenv.config({ path: path.resolve(process.cwd(), 'backend/.env') });
 
 const app = express();
-app.use(cors());
+
+// ============================================================================
+// CORS — whitelist invece di wildcard *
+// ============================================================================
+// Origini permesse: dominio frontend produzione + localhost per dev.
+// La env var CORS_EXTRA_ORIGINS permette aggiungere domini al volo
+// (es. anteprime Render, CI, staging), formato: "https://a.com,https://b.com".
+// ============================================================================
+const DEFAULT_ALLOWED_ORIGINS = [
+  'https://cyber-lock-charm.onrender.com',
+  'http://localhost:5173',
+  'http://localhost:4173',
+  'http://127.0.0.1:5173',
+];
+const EXTRA_ORIGINS = (process.env.CORS_EXTRA_ORIGINS || '')
+  .split(',')
+  .map((s) => s.trim())
+  .filter(Boolean);
+const ALLOWED_ORIGINS = new Set([...DEFAULT_ALLOWED_ORIGINS, ...EXTRA_ORIGINS]);
+
+app.use(
+  cors({
+    origin: (origin, cb) => {
+      // origin null = stessa origine (server-to-server, curl) → permesso
+      if (!origin) return cb(null, true);
+      if (ALLOWED_ORIGINS.has(origin)) return cb(null, true);
+      console.warn(`[cors] origine bloccata: ${origin}`);
+      return cb(new Error('CORS: origine non permessa'));
+    },
+    credentials: false,
+  })
+);
 app.use(express.json());
+
+// ============================================================================
+// RATE LIMIT — protezione anti brute-force / abuso
+// ============================================================================
+// In-memory sliding window per IP. Non sopravvive a riavvio Render (free
+// tier cold start ogni ~15 min) ma e' sufficiente come barriera anti-script
+// senza dipendenze extra. Per produzione serie sostituire con Redis.
+// ============================================================================
+const rateLimitHits = new Map(); // key="ip|bucket" → array<ts>
+function rateLimit(bucket, maxPerMinute) {
+  return (req, res, next) => {
+    const ip = (
+      req.headers['x-forwarded-for']?.toString().split(',')[0]?.trim() ||
+      req.socket.remoteAddress ||
+      'unknown'
+    );
+    const key = `${ip}|${bucket}`;
+    const now = Date.now();
+    const windowStart = now - 60_000;
+    const hits = (rateLimitHits.get(key) || []).filter((t) => t > windowStart);
+    if (hits.length >= maxPerMinute) {
+      console.warn(`[rate-limit] ${ip} ha superato ${maxPerMinute}/min su ${bucket}`);
+      return res.status(429).json({
+        success: false,
+        error: `Troppe richieste. Riprova fra qualche secondo.`,
+      });
+    }
+    hits.push(now);
+    rateLimitHits.set(key, hits);
+    next();
+  };
+}
+// Cleanup periodico per non far crescere la Map
+setInterval(() => {
+  const cutoff = Date.now() - 60_000;
+  for (const [k, arr] of rateLimitHits.entries()) {
+    const kept = arr.filter((t) => t > cutoff);
+    if (kept.length === 0) rateLimitHits.delete(k);
+    else rateLimitHits.set(k, kept);
+  }
+}, 60_000).unref?.();
 
 // Serve static frontend files - cerca la cartella public in vari percorsi possibili
 const __filename = fileURLToPath(import.meta.url);
@@ -208,8 +280,14 @@ function getQueue(deviceId) {
  * POST /command/push
  * Body: { channel, deviceId?, lockerId?, pin?, source? }
  * Se deviceId non specificato → "tablet-main" (back-compat).
+ *
+ * SICUREZZA — verifica PIN server-side:
+ *   - source="customer-unlock" → PIN obbligatorio, validato su Supabase
+ *     contro una booking attiva per quel locker. PIN errato/scaduto = 403.
+ *   - source admin/test/release → bypass (chi opera in console e' gia'
+ *     autenticato e ha gia' verificato lo stato locker).
  */
-app.post('/command/push', requireApiKey, (req, res) => {
+app.post('/command/push', rateLimit('push', 60), requireApiKey, async (req, res) => {
   const { channel, deviceId, lockerId, pin, source } = req.body || {};
   if (!channel || !VALID_CHANNELS.has(channel)) {
     return res.status(400).json({
@@ -224,40 +302,101 @@ app.post('/command/push', requireApiKey, (req, res) => {
       error: 'deviceId non valido (a-z A-Z 0-9 _ - 1..64 char)',
     });
   }
+
+  // Verifica PIN per richieste customer. Se Supabase non e' configurato
+  // fallback permissivo (dev mode) ma logga l'evento.
+  const requirePinCheck = (source || 'web') === 'customer-unlock';
+  // Effective channel + device: il client puo' suggerirli, ma in
+  // customer-unlock la verita' viene dal DB. In test/admin usiamo
+  // quelli del client.
+  let effectiveChannel = channel;
+  let effectiveDevice = device;
+  if (requirePinCheck) {
+    if (!pin || !lockerId) {
+      return res.status(400).json({
+        success: false,
+        error: 'pin e lockerId obbligatori per customer-unlock',
+      });
+    }
+    if (!SUPABASE_CONFIGURED) {
+      console.warn('[command/push] customer-unlock con Supabase non configurato — accetto in dev mode');
+    } else {
+      const nowIso = new Date().toISOString();
+      const { data: bookings, error: bErr } = await supabase
+        .from('bookings')
+        .select('id, status, start_time, end_time, lockers(channel, device_id)')
+        .eq('locker_id', lockerId)
+        .eq('pin_code', pin)
+        .eq('status', 'active')
+        .lte('start_time', nowIso)
+        .gte('end_time', nowIso);
+      if (bErr) {
+        console.error('[command/push] verify-pin db error:', bErr.message || bErr);
+        return res.status(500).json({ success: false, error: 'PIN verification failed' });
+      }
+      if (!bookings || bookings.length === 0) {
+        logAuditEvent({
+          event_type: 'command_push_denied',
+          actor: 'customer-unlock',
+          subject: lockerId,
+          result: 'failed',
+          message: 'PIN invalid or expired',
+          metadata: { channel, pin },
+        });
+        await supabase.from('access_logs').insert([{
+          locker_id: lockerId,
+          result: 'failed_invalid_pin',
+          pin_used: pin,
+        }]);
+        return res.status(403).json({
+          success: false,
+          error: 'PIN non valido o prenotazione scaduta',
+        });
+      }
+      // OVERRIDE: usa channel + device dal DB (single source of truth).
+      const lockerRow = bookings[0].lockers;
+      if (lockerRow?.channel && VALID_CHANNELS.has(lockerRow.channel)) {
+        effectiveChannel = lockerRow.channel;
+      }
+      if (lockerRow?.device_id && VALID_DEVICE_ID.test(lockerRow.device_id)) {
+        effectiveDevice = lockerRow.device_id;
+      }
+    }
+  }
+
   const now = Date.now();
-  const lastForDev = lastPushAtByDevice.get(device) || 0;
+  const lastForDev = lastPushAtByDevice.get(effectiveDevice) || 0;
   if (now - lastForDev < PUSH_COOLDOWN_MS) {
     return res.status(429).json({
       success: false,
-      error: `Cooldown ${PUSH_COOLDOWN_MS}ms anti-raffica per ${device}`,
+      error: `Cooldown ${PUSH_COOLDOWN_MS}ms anti-raffica per ${effectiveDevice}`,
     });
   }
-  lastPushAtByDevice.set(device, now);
+  lastPushAtByDevice.set(effectiveDevice, now);
 
   const cmd = {
     id: `cmd-${now}-${Math.random().toString(36).slice(2, 7)}`,
-    channel,
-    deviceId: device,
+    channel: effectiveChannel,
+    deviceId: effectiveDevice,
     lockerId: lockerId || null,
     pin: pin || null,
     source: source || 'web',
     pushedAt: new Date(now).toISOString(),
   };
-  const q = getQueue(device);
+  const q = getQueue(effectiveDevice);
   q.push(cmd);
   if (q.length > MAX_QUEUE_PER_DEVICE) q.shift();
 
   console.log(
-    `📤 [command/push] ${channel} → ${device} · src=${cmd.source} · queue=${q.length}`
+    `📤 [command/push] ${effectiveChannel} → ${effectiveDevice} · src=${cmd.source} · queue=${q.length}`
   );
-  // Audit (non-blocking)
   logAuditEvent({
     event_type: 'command_push',
     actor: cmd.source,
-    subject: device,
+    subject: effectiveDevice,
     result: 'info',
-    message: `${channel} queued for ${device}`,
-    metadata: { channel, lockerId: cmd.lockerId, cmdId: cmd.id },
+    message: `${effectiveChannel} queued for ${effectiveDevice}`,
+    metadata: { channel: effectiveChannel, lockerId: cmd.lockerId, cmdId: cmd.id },
   });
   res.json({ success: true, queued: cmd, queueLength: q.length });
 });
@@ -470,7 +609,7 @@ app.post('/generate-booking', async (req, res) => {
  * 2. POST /verify-pin
  * Chiamato dal dispositivo ESP32 quando l'utente inserisce il PIN fisico
  */
-app.post('/verify-pin', async (req, res) => {
+app.post('/verify-pin', rateLimit('verify', 30), async (req, res) => {
   try {
     const { locker_id, pin_code } = req.body;
 
@@ -823,6 +962,88 @@ app.get('/admin/bookings', requireRole(['admin', 'operator']), async (req, res) 
     console.error('[admin/bookings]', err);
     res.status(500).json({ error: 'Failed to fetch bookings' });
   }
+});
+
+// ============================================================================
+// RESERVATION LOOKUP — codice LCK pubblico per cliente (no login)
+// ============================================================================
+// Il codice "LCK-XXXX" e' derivato dal booking.id (UUID): si prendono gli
+// ultimi 4 char esadecimali e si maiuscolizzano. E' una proiezione stateless
+// del booking — niente migrazione DB. In futuro, se serve un codice
+// completamente disaccoppiato (Nayax voucher, ecc.), si aggiunge una colonna
+// reservation_code e si modifica la lookup.
+// ============================================================================
+
+const RESERVATION_CODE_RE = /^LCK-[A-F0-9]{4}$/i;
+
+/**
+ * GET /reservation/:code
+ * Ritorna la prenotazione che termina con quel suffix. Se ci sono collisioni
+ * (raro, 1 su 65535) prende la piu' recente attiva. Endpoint pubblico —
+ * la "sicurezza" e' che servono i 4 hex giusti.
+ */
+app.get('/reservation/:code', rateLimit('reservation', 20), async (req, res) => {
+  const code = (req.params.code || '').trim().toUpperCase();
+  if (!RESERVATION_CODE_RE.test(code)) {
+    return res.status(400).json({ error: 'Codice non valido. Formato: LCK-XXXX' });
+  }
+  if (!SUPABASE_CONFIGURED) {
+    return res.status(503).json({ error: 'Database non configurato' });
+  }
+  const suffix = code.slice(4).toLowerCase();
+  try {
+    // Cerca tutte le bookings il cui id finisce col suffix.
+    // Postgres ilike '%xxxx' su UUID ::text. Limit 5, ordina per piu' recente.
+    const { data, error } = await supabase
+      .from('bookings')
+      .select('id, locker_id, pin_code, start_time, end_time, status, lockers(location, channel, device_id)')
+      .ilike('id', `%${suffix}`)
+      .order('start_time', { ascending: false })
+      .limit(5);
+    if (error) throw error;
+    if (!data || data.length === 0) {
+      return res.status(404).json({ error: 'Prenotazione non trovata' });
+    }
+    // Preferisci active, altrimenti la piu' recente
+    const b = data.find(x => x.status === 'active') || data[0];
+    res.json({
+      reservation_code: code,
+      booking_id: b.id,
+      locker_id: b.locker_id,
+      locker_location: b.lockers?.location || null,
+      locker_channel: b.lockers?.channel || null,
+      locker_device_id: b.lockers?.device_id || null,
+      pin_code: b.pin_code,
+      start_time: b.start_time,
+      end_time: b.end_time,
+      status: b.status,
+    });
+  } catch (err) {
+    console.error('[reservation/:code]', err);
+    res.status(500).json({ error: 'Lookup fallita' });
+  }
+});
+
+// ============================================================================
+// NAYAX WEBHOOK — placeholder per integrazione futura
+// ============================================================================
+// Quando il cliente di Eugenio sistemera' Nayax, qui arriveranno i webhook
+// di conferma pagamento. Per ora accetta qualunque payload, logga, e
+// risponde 200 (cosi' Nayax non riprova). La logica di creazione booking
+// + PIN andra' qui.
+// ============================================================================
+app.post('/nayax/webhook', async (req, res) => {
+  console.log('[nayax/webhook] payload ricevuto:', JSON.stringify(req.body || {}));
+  logAuditEvent({
+    event_type: 'nayax_webhook',
+    actor: 'nayax',
+    result: 'info',
+    message: 'Webhook ricevuto (placeholder, nessuna azione)',
+    metadata: { body: req.body || {} },
+  });
+  // TODO: validare firma Nayax, creare booking, generare PIN+codice LCK,
+  //       inviare email/SMS al cliente.
+  res.status(200).json({ received: true });
 });
 
 // Fallback: serve index.html per qualsiasi route non trovata (SPA-style)
