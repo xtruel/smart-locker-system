@@ -1191,6 +1191,62 @@ app.post(
 );
 
 // ============================================================================
+// OFFLINE SYNC — il tablet scarica le prenotazioni attive per poter aprire
+// le celle anche se la rete cade tra una scansione e l'altra.
+// ============================================================================
+// Ritorna SOLO i campi necessari per la lookup offline (no PIN, no user data).
+// Filtra per device_id cosi' ogni tablet riceve solo le sue.
+// ============================================================================
+app.get('/sync/active-bookings', requireApiKey, async (req, res) => {
+  const deviceId = (req.query.deviceId || DEFAULT_DEVICE_ID).toString();
+  if (!VALID_DEVICE_ID.test(deviceId)) {
+    return res.status(400).json({ error: 'deviceId non valido' });
+  }
+  if (!SUPABASE_CONFIGURED) {
+    return res.status(503).json({ error: 'DB non configurato' });
+  }
+  try {
+    const nowIso = new Date().toISOString();
+    // Prima recupera i locker di questo device (con channel + id)
+    const { data: lockers, error: lErr } = await supabase
+      .from('lockers')
+      .select('id, channel, device_id')
+      .eq('device_id', deviceId);
+    if (lErr) throw lErr;
+    if (!lockers || lockers.length === 0) {
+      return res.json({ bookings: [], synced_at: nowIso });
+    }
+    const lockerIds = lockers.map((l) => l.id);
+    const chMap = new Map(lockers.map((l) => [l.id, l.channel]));
+
+    const { data: bookings, error: bErr } = await supabase
+      .from('bookings')
+      .select('id, locker_id, end_time')
+      .in('locker_id', lockerIds)
+      .eq('status', 'active')
+      .lte('start_time', nowIso)
+      .gte('end_time', nowIso);
+    if (bErr) throw bErr;
+
+    // Mappa in formato minimale: { code, channel, expires }
+    const out = (bookings || [])
+      .map((b) => {
+        const channel = chMap.get(b.locker_id);
+        if (!channel) return null;
+        const hex = b.id.replace(/-/g, '');
+        const code = `LCK-${hex.slice(-8).toUpperCase()}`;
+        return { code, channel, expires: b.end_time };
+      })
+      .filter(Boolean);
+
+    res.json({ bookings: out, synced_at: nowIso });
+  } catch (err) {
+    console.error('[sync/active-bookings]', err);
+    res.status(500).json({ error: 'Sync fallita' });
+  }
+});
+
+// ============================================================================
 // NAYAX WEBHOOK — placeholder per integrazione futura
 // ============================================================================
 // Quando il cliente di Eugenio sistemera' Nayax, qui arriveranno i webhook
