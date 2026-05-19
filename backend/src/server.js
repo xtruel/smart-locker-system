@@ -1004,14 +1004,13 @@ app.get('/reservation/:code', rateLimit('reservation', 20), async (req, res) => 
   try {
     // Cerca tutte le bookings il cui id finisce col suffix.
     // Postgres ilike '%xxxx' su UUID ::text. Limit 5, ordina per piu' recente.
-    // Due query separate per evitare problemi di cache schema PostgREST
-    // quando si aggiungono colonne nuove a lockers (channel/device_id).
-    const { data, error } = await supabase
-      .from('bookings')
-      .select('id, locker_id, pin_code, start_time, end_time, status')
-      .ilike('id', `%${suffix}`)
-      .order('start_time', { ascending: false })
-      .limit(5);
+    // Usiamo una funzione SQL helper perche' ILIKE su colonna UUID richiede
+    // cast a text (non supportato direttamente da PostgREST/supabase-js).
+    // La funzione find_booking_by_code(text) fa SELECT ... WHERE id::text
+    // ILIKE '%suffix'.
+    const { data, error } = await supabase.rpc('find_booking_by_code', {
+      code_suffix: suffix,
+    });
     if (error) throw error;
     if (!data || data.length === 0) {
       return res.status(404).json({ error: 'Prenotazione non trovata' });
