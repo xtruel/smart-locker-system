@@ -319,7 +319,13 @@ app.post('/command/push', rateLimit('push', 60), requireApiKey, async (req, res)
       });
     }
     if (!SUPABASE_CONFIGURED) {
-      console.warn('[command/push] customer-unlock con Supabase non configurato — accetto in dev mode');
+      // Modalita' "solo Render / no DB": nessuna prenotazione da verificare,
+      // quindi l'apertura self-service col PIN e' disabilitata per sicurezza.
+      // Clienti = QR fisso per cella; staff = apertura con source=admin.
+      return res.status(503).json({
+        success: false,
+        error: 'Apertura con PIN non disponibile su questo impianto. Usa il QR della cella.',
+      });
     } else {
       const nowIso = new Date().toISOString();
       const { data: bookings, error: bErr } = await supabase
